@@ -19,7 +19,7 @@ connectDB();
 // purely to reject obvious typos at write time (e.g. "durban_noth") before
 // they create a silent phantom "location" in the data. Add a new slug here
 // when a new tent is deployed, matching its ESP32's LOCATION_ID exactly.
-const KNOWN_LOCATIONS = ["durban_north", "namibia", "sweet_waters"];
+const KNOWN_LOCATIONS = ["durban_north", "namibia", "sweet_waters", "qachas_nek_1"];
 
 function isValidLocationId(locationId) {
   return typeof locationId === "string" && KNOWN_LOCATIONS.includes(locationId.toLowerCase());
