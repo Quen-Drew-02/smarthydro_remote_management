@@ -4,7 +4,11 @@ const cors = require("cors");
 const connectDB = require("./db/connection");
 const Sensor = require("./models/Sensor");
 const Command = require("./models/Command");
- const Photo = require("./models/Photo");
+const Photo = require("./models/Photo");
+ 
+const Location = require("./models/Location");
+const { PIN_FORMAT, verifyPin } = require("./utils/pin");
+
 const app = express();
 app.use(express.json());
 app.use(cors());
@@ -135,6 +139,42 @@ app.get("/locations", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Unlock location(s) with a PIN
+//
+// The app sends a 6-digit PIN, the backend finds which document it belongs
+// to. A location PIN unlocks that one location; the master PIN unlocks
+// every location that has a Location document. The app stores the returned
+// ids on the Device and only shows those Locations to the User
+app.post("/locations/unlock", async (req, res) => {
+  const { pin } = req.body;
+
+  if (typeof pin !== "string" || !PIN_FORMAT.test(pin)) {
+    return res.status(400).json({ error: "PIN must be exactly 6 Digits" });
+  }
+
+  const docs = await Location.find({});
+
+  let matched = null;
+  for (const doc of docs) {
+    if (await verifyPin(pin, doc.pinHash)) {
+      matched = doc;
+      break;
+    }
+  }
+
+  // Same response for "Wrong PIN" and "no PINs Configured"
+  if (!matched) {
+    return res.status(401).json({ error: "Invalid PIN" });
+  }
+
+  if (matched.role === "master") {
+    const unlocked = docs.filter((d) => d.role === "location").map((d) => d.locationId);
+    return res.json({ unlocked, master: true });
+  }
+
+  res.json({ unlocked: [matched.locationId], master: false });
 });
 
 //App calls this to request a fresh photo from the tent's camera
