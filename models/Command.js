@@ -26,6 +26,9 @@ const CommandSchema = new mongoose.Schema({
     default: false
   },
 
+  // Set when an ESP32 collects the command, shows how long a command waited before it was picked up
+  executedAt: { type: Date },
+
   createdAt: { type: Date, default: Date.now }
 });
 

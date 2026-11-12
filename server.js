@@ -9,6 +9,8 @@ const Photo = require("./models/Photo");
 const Location = require("./models/Location");
 const { PIN_FORMAT, verifyPin } = require("./utils/pin");
 
+const registry = require("./utils/locationRegistry");
+
 const app = express();
 app.use(express.json());
 app.use(cors());
@@ -16,18 +18,11 @@ app.use(cors());
 // 🔌 connect database
 connectDB();
 
-// Known Deployed Tents. This is intentionally a soft guard, not a hard
-// schema constraint - GET /locations always reflects whatever locationIds
-// actually exist in the Sensor collection, so a new tent still shows up in
-// the app automatically once it posts its first reading. This list exists
-// purely to reject obvious typos at write time (e.g. "durban_noth") before
-// they create a silent phantom "location" in the data. Add a new slug here
-// when a new tent is deployed, matching its ESP32's LOCATION_ID exactly.
-const KNOWN_LOCATIONS = ["durban_north", "namibia", "sweet_waters", "qachas_nek_1", "sweetwaters_tunnel"];
+registry.startAutoRefresh();
 
-function isValidLocationId(locationId) {
-  return typeof locationId === "string" && KNOWN_LOCATIONS.includes(locationId.toLowerCase());
-}
+// Locations now live in the database (see utils/locationRegistry.js);
+// the old Hardcoded list is only a fallback for unregistered slugs
+const isValidLocationId = registry.isValid;
 
 // ===== ROUTES =====
 
@@ -43,7 +38,7 @@ app.post("/data", async (req, res) => {
     const { locationId } = req.body;
     if (!isValidLocationId(locationId)) {
       return res.status(400).json({
-        error: "locationId is Required and Must be one of: " + KNOWN_LOCATIONS.join(", ")
+        error: "locationId is Required and Must be one of: " + registry.listIds().join(", ")
       });
     }
 
@@ -65,7 +60,7 @@ app.get("/command", async (req, res) => {
   const { locationId } = req.query;
   if (!isValidLocationId(locationId)) {
     return res.status(400).json({
-      error: "locationId query param is Required and must be one of: " + KNOWN_LOCATIONS.join(", ")
+      error: "locationId query param is Required and must be one of: " + registry.listIds().join(", ")
     });
   }
 
@@ -76,6 +71,7 @@ app.get("/command", async (req, res) => {
 
   if (cmd) {
     cmd.executed = true;
+    cmd.executedAt = new Date();
     await cmd.save();
     return res.send(cmd.command);
   }
@@ -91,7 +87,7 @@ app.post("/command", async (req, res) => {
 
   if (!isValidLocationId(locationId)) {
     return res.status(400).json({
-      error: "locationId is Required and Must be one of: " + KNOWN_LOCATIONS.join(", ")
+      error: "locationId is Required and Must be one of: " + registry.listIds().join(", ")
     });
   }
 
@@ -116,7 +112,7 @@ app.get("/data", async (req, res) => {
   if (locationId) {
     if (!isValidLocationId(locationId)) {
       return res.status(400).json({
-        error: "locationId must be one of: " + KNOWN_LOCATIONS.join(", ")
+        error: "locationId must be one of: " + registry.listIds().join(", ")
       });
     }
     filter.locationId = locationId.toLowerCase();
@@ -135,7 +131,7 @@ app.get("/data", async (req, res) => {
 app.get("/locations", async (req, res) => {
   try {
     const locations = await Sensor.distinct("locationId");
-    res.json({ locations: locations.filter(Boolean) });  // Filter out falsy values (null, empty strings) from legacy or unvalidated data
+    res.json({ locations: locations.filter((id) => id && !registry.isInactive(id)) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -170,8 +166,16 @@ app.post("/locations/unlock", async (req, res) => {
   }
 
   if (matched.role === "master") {
-    const unlocked = docs.filter((d) => d.role === "location").map((d) => d.locationId);
+    // Master unlocks every ACTIVE location, never a deactivated one
+    const unlocked = docs
+      .filter((d) => d.role === "location" && d.active !== false)
+      .map((d) => d.locationId);
     return res.json({ unlocked, master: true });
+  }
+
+  // A Deactivated locations own PIN unlocks Nothing
+  if (matched.active === false) {
+    return res.json({ unlocked: [], master: false });
   }
 
   res.json({ unlocked: [matched.locationId], master: false });
@@ -182,7 +186,7 @@ app.post("/photo/request", async (req, res) => {
   const { locationId } = req.body;
   if (!isValidLocationId(locationId)) {
     return res.status(400).json({
-      error: "locationId is Required and Must be one of: " + KNOWN_LOCATIONS.join(", ")
+      error: "locationId is Required and Must be one of: " + registry.listIds().join(", ")
     });
   }
  
@@ -200,7 +204,7 @@ app.get("/photo/pending", async (req, res) => {
   const { locationId } = req.query;
   if (!isValidLocationId(locationId)) {
     return res.status(400).json({
-      error: "locationId query param is Required and must be one of: " + KNOWN_LOCATIONS.join(", ")
+      error: "locationId query param is Required and must be one of: " + registry.listIds().join(", ")
     });
   }
  
@@ -213,7 +217,7 @@ app.post("/photo", express.raw({ type: "image/jpeg", limit: "5mb" }), async (req
   const { locationId } = req.query;
   if (!isValidLocationId(locationId)) {
     return res.status(400).json({
-      error: "locationId query param is Required and must be one of: " + KNOWN_LOCATIONS.join(", ")
+      error: "locationId query param is Required and must be one of: " + registry.listIds().join(", ")
     });
   }
   if (!req.body || !req.body.length) {
@@ -235,7 +239,7 @@ app.get("/photo", async (req, res) => {
   const { locationId } = req.query;
   if (!isValidLocationId(locationId)) {
     return res.status(400).json({
-      error: "locationId query param is Required and must be one of: " + KNOWN_LOCATIONS.join(", ")
+      error: "locationId query param is Required and must be one of: " + registry.listIds().join(", ")
     });
   }
  
@@ -267,6 +271,8 @@ app.get("/photo/file", async (req, res) => {
   res.send(photo.data);
 });
  
+// TODO: unauthenticated by decision, Protect before any public deployment
+app.use("/admin", require("./routes/admin"));
 
 const PORT = process.env.PORT || 3000;
 

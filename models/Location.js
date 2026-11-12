@@ -20,13 +20,18 @@ const LocationSchema = new mongoose.Schema({
     locationId: {
         type: String,
         trim: true,
-        lowercase: true, // Matches how locationId is Normalised elsewhere
+        lowercase: true,
         unique: true,
         sparse: true,
         required: function () {
             return this.role === "location";
         }
     },
+
+    displayName: { type: String, trim: true, maxlength: 60 },
+
+    // false = deactivated: ingestion, commands and unlocking All Stop
+    active: { type: Boolean, default: true },
 
     // "salt:hash" produced by utils/pin.js - The PIN is Never Stored
     pinHash: { type: String, required: true },
