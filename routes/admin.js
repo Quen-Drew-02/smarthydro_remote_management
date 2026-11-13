@@ -48,6 +48,11 @@ async function buildRow(locationId, doc) {
         active: doc ? doc.active !== false : true,
         updatedAt: doc ? doc.updatedAt : null,
         lastReadingAt: latest ? latest.timestamp : null,
+        // Computed on the server so the app needs no date library and is immune
+        // to a wrong device clock. The app adds the time elapsed since it fetched.
+        lastReadingAgeSeconds: latest
+            ? Math.max(0, Math.round((Date.now() - new Date(latest.timestamp).getTime()) / 1000))
+            : null,
         status: statusFor(latest ? latest.timestamp : null),
         latestReading: latest
             ? {
