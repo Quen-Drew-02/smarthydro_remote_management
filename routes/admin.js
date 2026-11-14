@@ -31,6 +31,10 @@ const isSlug = (s) => typeof s === "string" && s.length >= 3 && s.length <= 40 &
 const wrap = (fn) => (req, res) =>
     fn(req, res).catch((err) => res.status(500).json({ error: err.message }));
 
+// Every error carries a machine-readable `code` next to the English message,
+// so the app can show it in the admin's own language.
+const fail = (res, status, code, message) => res.status(status).json({ code, error: message });
+
 function statusFor(lastAt) {
     if (!lastAt) return "no_data";
     const age = Date.now() - new Date(lastAt).getTime();
@@ -63,16 +67,23 @@ async function buildRow(locationId, doc) {
     };
 }
 
-// Validates a supplied PIN, or generates a unique one. `excludeId` is the
-// document being updated, so rotating a PIN doesn't collide with itself
+// Validates a Supplied PIN, or generates a unique one. `excludeId` is the
+// document being updated, so rotating a PIN doesn't collide with itself.
+// Failures carry the HTTP status and Error Code to Send back
 async function resolvePin(supplied, excludeId) {
     const all = await Location.find({});
     const others = all.filter((d) => !excludeId || String(d._id) !== String(excludeId));
 
     if (supplied !== undefined) {
-        if (typeof supplied !== "string" || !PIN_FORMAT.test(supplied)) return { error: "PIN must be exactly 6 digits" };
-        if (isWeakPin(supplied)) return { error: "That PIN is too easy to guess" };
-        if (await findPinOwner(supplied, others)) return { error: "That PIN is already in use" };
+        if (typeof supplied !== "string" || !PIN_FORMAT.test(supplied)) {
+            return { status: 400, code: "PIN_INVALID", error: "PIN must be exactly 6 Digits" };
+        }
+        if (isWeakPin(supplied)) {
+            return { status: 400, code: "PIN_WEAK", error: "That PIN is too easy to Guess" };
+        }
+        if (await findPinOwner(supplied, others)) {
+            return { status: 409, code: "PIN_IN_USE", error: "That PIN is already in Use" };
+        }
         return { pin: supplied, generated: false };
     }
 
@@ -82,7 +93,7 @@ async function resolvePin(supplied, excludeId) {
             return { pin: candidate, generated: true };
         }
     }
-    return { error: "Could not Generate a unique PIN, Please Try Again" };
+    return { status: 500, code: "PIN_GENERATION_FAILED", error: "Could not Generate a unique PIN, please Try Again" };
 }
 
 // Connection test. Returns the database name so the app can show whether it is pointed at dev or production
@@ -125,15 +136,16 @@ router.post("/locations", wrap(async (req, res) => {
     const displayName = typeof req.body.displayName === "string" ? req.body.displayName.trim() : "";
 
     if (!isSlug(locationId)) {
-        return res.status(400).json({ error: "locationId must be 3-40 characters: lowercase letters, digits and single underscores" });
+        return fail(res, 400, "SLUG_INVALID", "locationId must be 3-40 characters: lowercase letters, digits and single underscores");
     }
-    if (displayName.length > 60) return res.status(400).json({ error: "displayName is too long" });
+    if (displayName.length > 60) return fail(res, 400, "NAME_TOO_LONG", "displayName is too Long");
+
     if (await Location.exists({ role: "location", locationId })) {
-        return res.status(409).json({ error: "That location is already registered" });
+        return fail(res, 409, "LOCATION_EXISTS", "That location is already Registered");
     }
 
     const resolved = await resolvePin(req.body.pin);
-    if (resolved.error) return res.status(400).json({ error: resolved.error });
+    if (resolved.error) return fail(res, resolved.status, resolved.code, resolved.error);
 
     const doc = await Location.create({
         role: "location",
@@ -153,17 +165,17 @@ router.post("/locations", wrap(async (req, res) => {
 router.patch("/locations/:locationId", wrap(async (req, res) => {
     const locationId = req.params.locationId.toLowerCase();
     const doc = await Location.findOne({ role: "location", locationId });
-    if (!doc) return res.status(404).json({ error: "Location is not registered yet" });
+    if (!doc) return fail(res, 404, "NOT_FOUND", "Location is not registered yet");
 
     const { displayName, active } = req.body;
     if (displayName !== undefined) {
         if (typeof displayName !== "string" || displayName.trim().length > 60) {
-            return res.status(400).json({ error: "Invalid displayName" });
+            return fail(res, 400, "NAME_TOO_LONG", "displayName must be text of at most 60 characters");
         }
         doc.displayName = displayName.trim() || undefined; // empty string clears it
     }
     if (active !== undefined) {
-        if (typeof active !== "boolean") return res.status(400).json({ error: "active must be true or false" });
+        if (typeof active !== "boolean") return fail(res, 400, "ACTIVE_INVALID", "active must be true or false");
         doc.active = active;
     }
     doc.updatedAt = new Date();
@@ -177,10 +189,10 @@ router.patch("/locations/:locationId", wrap(async (req, res) => {
 router.post("/locations/:locationId/pin", wrap(async (req, res) => {
     const locationId = req.params.locationId.toLowerCase();
     const doc = await Location.findOne({ role: "location", locationId });
-    if (!doc) return res.status(404).json({ error: "Location is not registered yet" });
+    if (!doc) return fail(res, 404, "NOT_FOUND", "Location is not registered yet");
 
     const resolved = await resolvePin(req.body.pin, doc._id);
-    if (resolved.error) return res.status(400).json({ error: resolved.error });
+    if (resolved.error) return fail(res, resolved.status, resolved.code, resolved.error);
 
     doc.pinHash = await hashPin(resolved.pin);
     doc.updatedAt = new Date();
@@ -199,7 +211,7 @@ router.get("/master", wrap(async (req, res) => {
 router.post("/master/pin", wrap(async (req, res) => {
     const existing = await Location.findOne({ role: "master" });
     const resolved = await resolvePin(req.body.pin, existing ? existing._id : undefined);
-    if (resolved.error) return res.status(400).json({ error: resolved.error });
+    if (resolved.error) return fail(res, resolved.status, resolved.code, resolved.error);
 
     const pinHash = await hashPin(resolved.pin);
     if (existing) {
