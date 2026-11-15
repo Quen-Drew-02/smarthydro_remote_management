@@ -41,6 +41,33 @@ function statusFor(lastAt) {
     return age < ONLINE_MS ? "online" : age < DELAYED_MS ? "delayed" : "offline";
 }
 
+// pending -> nobody has collected it; collected -> a tent picked it up;
+// cancelled -> an admin cancelled it first. executedAt wins, so if a tent
+// collected it in the instant a cancel arrived, it reads as collected.
+function commandStatus(c) {
+    if (c.cancelledAt && !c.executedAt) return "cancelled";
+    return c.executed === true ? "collected" : "pending";
+}
+
+// Ages are computed on the server so the app needs no date library and a
+// wrong device clock cannot skew them.
+function shapeCommand(c) {
+    const created = new Date(c.createdAt).getTime();
+    return {
+        id: String(c._id),
+        locationId: c.locationId,
+        command: c.command,
+        status: commandStatus(c),
+        createdAt: c.createdAt,
+        executedAt: c.executedAt || null,
+        cancelledAt: c.cancelledAt || null,
+        ageSeconds: Math.max(0, Math.round((Date.now() - created) / 1000)),
+        collectedAfterSeconds: c.executedAt
+            ? Math.max(0, Math.round((new Date(c.executedAt).getTime() - created) / 1000))
+            : null
+    };
+}
+
 // One location's row for the fleet list. `doc` is null for a legacy slug
 // that has not been registered yet
 async function buildRow(locationId, doc) {
@@ -121,10 +148,7 @@ router.get("/locations/:locationId", wrap(async (req, res) => {
     const recent = await Command.find({ locationId }).sort({ createdAt: -1 }).limit(10).lean();
     res.json({
         ...row,
-        recentCommands: recent.map((c) => ({
-            id: String(c._id), command: c.command, executed: c.executed === true,
-            createdAt: c.createdAt, executedAt: c.executedAt || null
-        }))
+        recentCommands: recent.map(shapeCommand)
     });
 }));
 
@@ -237,12 +261,39 @@ router.get("/commands", wrap(async (req, res) => {
     if (req.query.locationId) filter.locationId = String(req.query.locationId).toLowerCase();
 
     const rows = await Command.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
-    res.json({
-        commands: rows.map((c) => ({
-            id: String(c._id), locationId: c.locationId, command: c.command,
-            executed: c.executed === true, createdAt: c.createdAt, executedAt: c.executedAt || null
-        }))
-    });
+    res.json({ commands: rows.map(shapeCommand) });
+}));
+
+// Queue a command for a tent. Body: { locationId, command }
+// Validated here (the public POST /command accepts any string)
+router.post("/commands", wrap(async (req, res) => {
+    const locationId = String(req.body.locationId || "").toLowerCase();
+    const command = String(req.body.command || "");
+
+    if (!SUPPORTED_COMMANDS.includes(command)) return fail(res, 400, "COMMAND_UNKNOWN", "Unsupported command");
+    if (!registry.isValid(locationId)) return fail(res, 400, "LOCATION_INACTIVE", "That location is not Active");
+
+    const doc = await Command.create({ locationId, command });
+    res.status(201).json({ command: shapeCommand(doc) });
+}));
+
+// Cancel a command no Location has collected yet
+router.post("/commands/:id/cancel", wrap(async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) return fail(res, 404, "COMMAND_NOT_FOUND", "Command not Found");
+
+    // Atomic: only an uncollected command can be cancelled, so this can never
+    // overwrite a command the tent collected a moment earlier
+    const updated = await Command.findOneAndUpdate(
+        { _id: req.params.id, executed: false },
+        { $set: { executed: true, cancelledAt: new Date() } },
+        { new: true }
+    );
+    if (updated) return res.json({ command: shapeCommand(updated) });
+
+    const existing = await Command.findById(req.params.id);
+    if (!existing) return fail(res, 404, "COMMAND_NOT_FOUND", "Command not Found");
+    if (existing.cancelledAt) return res.json({ command: shapeCommand(existing) }); // already cancelled: fine
+    return fail(res, 409, "COMMAND_ALREADY_COLLECTED", "That Command was already Collected by the Tent");
 }));
 
 // ---------- Readings History (trend charts) ----------

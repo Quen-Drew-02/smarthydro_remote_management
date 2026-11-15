@@ -67,7 +67,7 @@ app.get("/command", async (req, res) => {
   const cmd = await Command.findOne({
     locationId: locationId.toLowerCase(),
     executed: false
-  }).sort({ createdAt: -1 });
+  }).sort({ createdAt: 1 }); // oldest first: commands run in the order they were sent
 
   if (cmd) {
     cmd.executed = true;

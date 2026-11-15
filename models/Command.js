@@ -29,6 +29,12 @@ const CommandSchema = new mongoose.Schema({
   // Set when an ESP32 collects the command, shows how long a command waited before it was picked up
   executedAt: { type: Date },
 
+  // Set when an admin cancels a command before any tent collected it. A
+  // cancelled command is also marked executed:true so the tent's poll
+  // (which only returns executed:false) never delivers it, without
+  // changing that live route.
+  cancelledAt: { type: Date },
+
   createdAt: { type: Date, default: Date.now }
 });
 
