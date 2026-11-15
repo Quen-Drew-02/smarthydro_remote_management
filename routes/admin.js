@@ -35,6 +35,12 @@ const wrap = (fn) => (req, res) =>
 // so the app can show it in the admin's own language.
 const fail = (res, status, code, message) => res.status(status).json({ code, error: message });
 
+const clamp = (n, lo, hi) => Math.min(Math.max(n, lo), hi);
+const finiteOrNull = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+
+// Sensor field in MongoDB for each metric key sent to the app
+const METRIC_FIELDS = { temperature: "Temperature", humidity: "Humidity", ph: "PH", ec: "EC", light: "Light" };
+
 function statusFor(lastAt) {
     if (!lastAt) return "no_data";
     const age = Date.now() - new Date(lastAt).getTime();
@@ -296,30 +302,72 @@ router.post("/commands/:id/cancel", wrap(async (req, res) => {
     return fail(res, 409, "COMMAND_ALREADY_COLLECTED", "That Command was already Collected by the Tent");
 }));
 
-// ---------- Readings History (trend charts) ----------
+// ---------- Readings history (trend charts) ----------
 
 // Query: locationId (required), hours (1-168, default 24), maxPoints (10-1000, default 288).
-// Readings are thinned by a fixed stride so a week of data stays chart sized
+//
+// Readings are grouped into equal TIME buckets and each bucket reports the
+// average, minimum and maximum of every metric. Compared with "keep every Nth
+// reading": averaging keeps a noisy sensor (pH!) readable, min/max keep brief
+// spikes visible, and a missing bucket is an honest gap (the tent was not
+// reporting) instead of a straight line drawn across it.
+// Ages are seconds before NOW, measured on the server, so a wrong device clock
+// cannot shift the chart.
 router.get("/readings", wrap(async (req, res) => {
     const locationId = String(req.query.locationId || "").toLowerCase();
-    if (!isSlug(locationId)) return res.status(400).json({ error: "locationId is required" });
+    if (!isSlug(locationId)) return fail(res, 400, "SLUG_INVALID", "locationId is required");
 
-    const hours = Math.min(Math.max(parseInt(req.query.hours, 10) || 24, 1), 168);
-    const maxPoints = Math.min(Math.max(parseInt(req.query.maxPoints, 10) || 288, 10), 1000);
-    const since = new Date(Date.now() - hours * 3600 * 1000);
+    const hours = clamp(parseInt(req.query.hours, 10) || 24, 1, 168);
+    const maxPoints = clamp(parseInt(req.query.maxPoints, 10) || 288, 10, 1000);
 
-    const rows = await Sensor.find({ locationId, timestamp: { $gte: since } })
-        .sort({ timestamp: 1 }).lean();
+    const nowMs = Date.now();
+    const windowMs = hours * 3600 * 1000;
+    const startMs = nowMs - windowMs;
+    // At least 60 s (a tent pushes about every 30 s), widened so the window fits in maxPoints
+    const bucketMs = Math.max(60000, Math.ceil(windowMs / maxPoints / 1000) * 1000);
 
-    const stride = Math.max(1, Math.ceil(rows.length / maxPoints));
-    const points = rows
-        .filter((_, i) => i % stride === 0 || i === rows.length - 1) // always keep the newest
-        .map((r) => ({
-            t: r.timestamp, temperature: r.Temperature, humidity: r.Humidity,
-            ph: r.PH, ec: r.EC, light: r.Light, flowRate: r.FlowRate
-        }));
+    // Bucket number = how many bucket-widths after the window start this reading is
+    const group = {
+        _id: { $floor: { $divide: [{ $subtract: [{ $toLong: "$timestamp" }, startMs] }, bucketMs] } },
+        count: { $sum: 1 }
+    };
+    for (const [key, field] of Object.entries(METRIC_FIELDS)) {
+        group[`${key}Avg`] = { $avg: `$${field}` };
+        group[`${key}Min`] = { $min: `$${field}` };
+        group[`${key}Max`] = { $max: `$${field}` };
+    }
 
-    res.json({ locationId, hours, count: points.length, points });
+    const rows = await Sensor.aggregate([
+        { $match: { locationId, timestamp: { $gte: new Date(startMs), $lte: new Date(nowMs) } } },
+        { $group: group },
+        { $sort: { _id: 1 } } // oldest first
+    ]);
+
+    const points = rows.map((row) => {
+        const bucketMiddleMs = startMs + (row._id + 0.5) * bucketMs;
+        const point = {
+            ageSeconds: Math.max(0, Math.round((nowMs - bucketMiddleMs) / 1000)),
+            count: row.count
+        };
+        for (const key of Object.keys(METRIC_FIELDS)) {
+            const avg = finiteOrNull(row[`${key}Avg`]);
+            point[key] = {
+                avg: avg === null ? null : Math.round(avg * 1000) / 1000,
+                min: finiteOrNull(row[`${key}Min`]),
+                max: finiteOrNull(row[`${key}Max`])
+            };
+        }
+        return point;
+    });
+
+    res.json({
+        locationId,
+        hours,
+        windowSeconds: hours * 3600,
+        bucketSeconds: bucketMs / 1000,
+        count: points.length,
+        points
+    });
 }));
 
 module.exports = router;
